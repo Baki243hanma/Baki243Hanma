@@ -1,137 +1,83 @@
 /**
- * Base PostgreSQL réelle en mémoire (PGlite) avec les migrations du dossier supabase/migrations.
- * Simule Supabase : schéma auth (auth.users, auth.uid()), rôles anon / authenticated, RLS.
- * Un « adaptateur distant » implémente RemoteAdapter en appelant les mêmes fonctions SQL que l'application.
+ * Base PostgreSQL réelle en mémoire (PGlite) avec les migrations de db/migrations, appliquées
+ * par le même migrateur que le serveur (server/db.js).
+ *
+ * Simulation de la production :
+ *  - le serveur (rôle propriétaire) appelle les fonctions SQL après vérification du jeton ;
+ *  - « app_reader » est un rôle sans écriture soumis à la RLS : il sert à vérifier que la RLS
+ *    refuse les lectures hors de la boutique, même si une requête atteignait la base directement.
  */
 import { PGlite } from '@electric-sql/pglite';
-import { readdirSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import type { OpType } from '../../src/domain/types';
-import { ServerError, TransportError, type RemoteAdapter, type RemoteResult, type RemoteSnapshot } from '../../src/sync/remote';
+import { randomUUID } from 'node:crypto';
+import { migrate, withUser } from '../../server/db.js';
+import type { Database } from '../../server/app.js';
+import { TransportError, type RemoteAdapter } from '../../src/sync/remote';
 
-const MIGRATIONS_DIR = join(process.cwd(), 'supabase/migrations');
-
-const SUPABASE_STUB_SQL = `
-  create role anon nologin;
-  create role authenticated nologin;
-  create schema auth;
-  create table auth.users (id uuid primary key, email text);
-  create function auth.uid() returns uuid language sql stable as $$
-    select nullif(current_setting('request.jwt.claim.sub', true), '')::uuid
-  $$;
-  grant usage on schema public to anon, authenticated;
-  grant usage on schema auth to anon, authenticated;
+const READER_SETUP_SQL = `
+  create role app_reader nologin;
+  grant usage on schema public to app_reader;
+  alter default privileges in schema public grant select on tables to app_reader;
 `;
 
 export async function createTestDatabase(): Promise<PGlite> {
   const pg = new PGlite();
-  await pg.exec(SUPABASE_STUB_SQL);
-  const files = readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.endsWith('.sql'))
-    .sort();
-  for (const file of files) {
-    await pg.exec(readFileSync(join(MIGRATIONS_DIR, file), 'utf8'));
-  }
+  await pg.exec(READER_SETUP_SQL);
+  await migrate(pgliteDatabase(pg));
+  await pg.exec(`
+    grant execute on function public.current_user_id() to app_reader;
+    grant execute on function public.is_shop_member(uuid) to app_reader;
+  `);
   return pg;
 }
 
-/** Crée un compte (auth.users) et renvoie son identifiant. */
-export async function createUser(pg: PGlite, label: string): Promise<string> {
-  await asAdmin(pg);
-  const { rows } = await pg.query<{ id: string }>(
-    'insert into auth.users (id, email) values (gen_random_uuid(), $1) returning id',
-    [`${label}@example.test`],
-  );
-  return rows[0].id;
-}
-
-/** Rôle propriétaire (contourne la RLS) : à utiliser uniquement pour préparer ou vérifier les données. */
-export async function asAdmin(pg: PGlite): Promise<void> {
-  await pg.exec('reset role');
-  await pg.query("select set_config('request.jwt.claim.sub', '', false)");
-}
-
-/** Session comme dans Supabase : rôle authenticated avec l'identifiant du compte, ou anon si null. */
-export async function asUser(pg: PGlite, userId: string | null): Promise<void> {
-  await pg.exec('reset role');
-  if (!userId) {
-    await pg.query("select set_config('request.jwt.claim.sub', '', false)");
-    await pg.exec('set role anon');
-    return;
-  }
-  await pg.query("select set_config('request.jwt.claim.sub', $1, false)", [userId]);
-  await pg.exec('set role authenticated');
-}
-
-/** Crée (ou récupère) la boutique du compte via la fonction publique ensure_shop. */
-export async function createShopFor(pg: PGlite, userId: string, name = 'Boutique test'): Promise<string> {
-  await asUser(pg, userId);
-  const { rows } = await pg.query<{ r: { id: string } }>('select public.ensure_shop($1) as r', [name]);
-  await asAdmin(pg);
-  return rows[0].r.id;
-}
-
-function toRemoteError(error: unknown): Error {
-  const e = error as { code?: string; message?: string };
-  if (typeof e?.code === 'string' && /^[0-9A-Z]{5}$/.test(e.code)) {
-    return new ServerError(e.code, e.message ?? 'Erreur serveur');
-  }
-  return new TransportError();
-}
-
-/** Adaptateur distant branché sur la base PGlite, avec la session d'un compte donné. */
-export function pgRemote(pg: PGlite, userId: string | null): RemoteAdapter {
+/** Adaptateur Database (même interface que server/db.js) fondé sur PGlite. */
+export function pgliteDatabase(pg: PGlite): Database {
   return {
-    async apply(op) {
-      await asUser(pg, userId);
-      try {
-        const { rows } = await pg.query<{ result: RemoteResult }>(
-          'select public.apply_sync_operation($1::uuid, $2::text, $3::jsonb) as result',
-          [op.op_id, op.type, JSON.stringify(op.payload)],
-        );
-        return rows[0].result;
-      } catch (error) {
-        throw toRemoteError(error);
-      } finally {
-        await asAdmin(pg);
-      }
+    async query<T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> {
+      return (await pg.query(sql, params)).rows as T[];
     },
-
-    async pull(shopId) {
-      await asUser(pg, userId);
-      try {
-        const shop = await pg.query<{ j: { id: string; name: string } }>(
-          'select to_jsonb(s) as j from public.shops s where s.id = $1',
-          [shopId],
-        );
-        const products = await pg.query<{ j: RemoteSnapshot['products'][number] }>(
-          'select to_jsonb(p) as j from public.products p where p.shop_id = $1 order by p.id',
-          [shopId],
-        );
-        const orders = await pg.query<{ j: RemoteSnapshot['orders'][number] }>(
-          `select to_jsonb(o) || jsonb_build_object('order_items',
-             coalesce((select jsonb_agg(to_jsonb(i) order by i.id) from public.order_items i where i.order_id = o.id), '[]'::jsonb)
-           ) as j
-           from public.orders o where o.shop_id = $1 order by o.id`,
-          [shopId],
-        );
-        const movements = await pg.query<{ j: RemoteSnapshot['movements'][number] }>(
-          'select to_jsonb(m) as j from public.stock_movements m where m.shop_id = $1 order by m.id',
-          [shopId],
-        );
-        return {
-          shop: shop.rows[0]?.j ?? null,
-          products: products.rows.map((r) => r.j),
-          orders: orders.rows.map((r) => r.j),
-          movements: movements.rows.map((r) => r.j),
-        };
-      } catch (error) {
-        throw toRemoteError(error);
-      } finally {
-        await asAdmin(pg);
-      }
+    async exec(sql) {
+      await pg.exec(sql);
+    },
+    async transaction(fn) {
+      return pg.transaction((tx) =>
+        fn({
+          query: async <T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> => (await tx.query(sql, params)).rows as T[],
+          exec: async (sql) => {
+            await tx.exec(sql);
+          },
+        }),
+      );
+    },
+    async close() {
+      await pg.close();
     },
   };
+}
+
+/** Identifiant de compte façon Neon Auth (valeur « sub » d'un JWT). */
+export async function createUser(_pg: PGlite, label: string): Promise<string> {
+  return `${label}-${randomUUID()}`;
+}
+
+/** Rôle propriétaire (contourne la RLS) : pour préparer ou vérifier les données. */
+export async function asAdmin(pg: PGlite): Promise<void> {
+  await pg.exec('reset role');
+  await pg.query("select set_config('app.user_id', '', false)");
+}
+
+/** Session du rôle de lecture soumis à la RLS, identifiée par userId (ou sans identité si null). */
+export async function asUser(pg: PGlite, userId: string | null): Promise<void> {
+  await pg.exec('reset role');
+  await pg.query("select set_config('app.user_id', $1, false)", [userId ?? '']);
+  await pg.exec('set role app_reader');
+}
+
+/** Crée (ou récupère) la boutique du compte via la fonction publique ensure_shop, comme le serveur. */
+export async function createShopFor(pg: PGlite, userId: string, name = 'Boutique test'): Promise<string> {
+  await asAdmin(pg);
+  const rows = await withUser(pgliteDatabase(pg), userId, (tx) => tx.query<{ r: { id: string } }>('select public.ensure_shop($1) as r', [name]));
+  return rows[0].r.id;
 }
 
 export interface FlakyControls {
@@ -190,5 +136,3 @@ export async function countRows(pg: PGlite, sql: string, params: unknown[] = [])
   const { rows } = await pg.query<{ n: number }>(`select count(*)::int as n from (${sql}) as q`, params);
   return rows[0].n;
 }
-
-export type { OpType };

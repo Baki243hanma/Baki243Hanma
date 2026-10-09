@@ -20,7 +20,7 @@ security definer
 set search_path = public, auth
 as $$
 declare
-  v_uid uuid := auth.uid();
+  v_uid text := public.current_user_id();
   v_shop public.shops%rowtype;
   v_shop_id uuid;
 begin
@@ -454,16 +454,13 @@ begin
 end;
 $$;
 
--- Droits d'exécution : seules les sessions connectées peuvent appeler les fonctions.
-revoke all on function public.is_shop_member(uuid) from public, anon;
-revoke all on function public.ensure_shop(text) from public, anon;
-revoke all on function public.apply_sync_operation(uuid, text, jsonb) from public, anon;
-revoke all on function public.op_create_order(uuid, uuid, jsonb) from public, anon, authenticated;
-revoke all on function public.op_cancel_order(uuid, uuid, jsonb) from public, anon, authenticated;
-revoke all on function public.op_upsert_product(uuid, uuid, jsonb) from public, anon, authenticated;
-revoke all on function public.op_stock_movement(uuid, uuid, jsonb) from public, anon, authenticated;
-revoke all on function public.op_update_shop(uuid, uuid, jsonb) from public, anon, authenticated;
+-- Droits d'exécution : les fonctions ne sont appelables que par le rôle propriétaire (le serveur api).
+revoke all on function public.is_shop_member(uuid) from public;
+revoke all on function public.ensure_shop(text) from public;
+revoke all on function public.apply_sync_operation(uuid, text, jsonb) from public;
+revoke all on function public.op_create_order(uuid, uuid, jsonb) from public;
+revoke all on function public.op_cancel_order(uuid, uuid, jsonb) from public;
+revoke all on function public.op_upsert_product(uuid, uuid, jsonb) from public;
+revoke all on function public.op_stock_movement(uuid, uuid, jsonb) from public;
+revoke all on function public.op_update_shop(uuid, uuid, jsonb) from public;
 
-grant execute on function public.is_shop_member(uuid) to authenticated;
-grant execute on function public.ensure_shop(text) to authenticated;
-grant execute on function public.apply_sync_operation(uuid, text, jsonb) to authenticated;

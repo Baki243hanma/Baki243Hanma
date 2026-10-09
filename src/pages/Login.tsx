@@ -4,7 +4,7 @@ import { Banner, Button, Card, Field, TextInput } from '../components/ui';
 import { useAsyncAction } from '../components/Confirm';
 import { useToast } from '../components/Toast';
 
-const MIN_PASSWORD = 6;
+const MIN_PASSWORD = 8;
 
 function Brand() {
   return (

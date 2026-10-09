@@ -113,7 +113,7 @@ export function SettingsPage() {
           </>
         ) : (
           <Banner tone="warning" title="Mode local (sans compte)">
-            Les données restent sur cet appareil uniquement. Aucune sauvegarde distante n’est active. Configurez Supabase pour créer des comptes et sauvegarder vos données (voir le README).
+            Les données restent sur cet appareil uniquement. Aucune sauvegarde distante n’est active. Configurez Neon Auth et la base Neon pour créer des comptes et sauvegarder vos données (voir le README).
           </Banner>
         )}
       </Card>
@@ -135,7 +135,7 @@ export function SettingsPage() {
           </div>
           <div>
             <dt className="text-slate-500">Mode</dt>
-            <dd className="font-semibold text-slate-900">{app.mode === 'remote' ? 'Serveur (Supabase)' : 'Local uniquement'}</dd>
+            <dd className="font-semibold text-slate-900">{app.mode === 'remote' ? 'Serveur (Neon)' : 'Local uniquement'}</dd>
           </div>
         </dl>
         {lastSync && <p className="text-sm text-slate-700">{lastSync.message}</p>}

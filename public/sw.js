@@ -35,7 +35,7 @@ self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  // Les requêtes vers Supabase (autre origine) ne sont jamais mises en cache : la sync gère les données.
+  // Les requêtes vers Neon Auth (autre origine) et vers /api (données, configuration) ne sont jamais mises en cache.
   if (url.origin !== self.location.origin) return;
 
   if (req.mode === 'navigate') {

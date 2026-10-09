@@ -82,7 +82,7 @@ export function Shell() {
         <div className="flex flex-col gap-4">
           {mode === 'local' && (
             <Banner tone="warning" title="Mode local : données sur cet appareil uniquement">
-              Aucune sauvegarde distante n’est active. Pour sauvegarder et synchroniser, configurez Supabase (voir le README).
+              Aucune sauvegarde distante n’est active. Pour sauvegarder et synchroniser, configurez Neon Auth et la base Neon (voir le README).
             </Banner>
           )}
           {!online && (

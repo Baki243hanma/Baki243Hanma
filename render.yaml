@@ -1,4 +1,6 @@
-# Déploiement Render (Web Service Node). Build : npm install (compile le front via postinstall). Démarrage : npm start.
+# Déploiement Render (Web Service Node).
+# Build : npm install (compile la PWA via postinstall). Démarrage : npm start (applique les migrations, puis écoute).
+# Les secrets (DATABASE_URL) ne sont jamais écrits ici : renseignez-les dans le tableau de bord Render.
 services:
   - type: web
     name: shopflow-rdc
@@ -11,7 +13,9 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 20.20.2
-      - key: SUPABASE_URL
+      - key: DATABASE_URL
         sync: false
-      - key: SUPABASE_ANON_KEY
+      - key: NEON_AUTH_URL
         sync: false
+      - key: MIGRATE_ON_START
+        value: "true"

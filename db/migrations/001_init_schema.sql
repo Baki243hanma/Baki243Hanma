@@ -1,3 +1,13 @@
+-- Fonction d’identité : le serveur (api) définit app.user_id dans la transaction,
+-- après avoir vérifié le JWT Neon Auth. Renvoie NULL si aucun compte n’est défini.
+create or replace function public.current_user_id()
+returns text
+language sql
+stable
+as $$
+  select nullif(current_setting('app.user_id', true), '')
+$$;
+
 -- =============================================================================
 -- ShopFlow RDC - Migration 0001 : schéma initial
 -- Montants : entiers en FC (bigint). Quantités : entiers. Aucun flottant.
@@ -13,9 +23,9 @@ create table if not exists public.shops (
   updated_at  timestamptz not null default now()
 );
 
--- Profil de boutique : relie un utilisateur Supabase Auth à sa boutique.
+-- Profil de boutique : relie un compte Neon Auth (identifiant « sub ») à sa boutique.
 create table if not exists public.shop_profiles (
-  user_id     uuid primary key references auth.users(id) on delete cascade,
+  user_id     text primary key,  -- identifiant du compte Neon Auth (sub du JWT)
   shop_id     uuid not null references public.shops(id) on delete restrict,
   role        text not null default 'owner' check (role in ('owner', 'member')),
   created_at  timestamptz not null default now()

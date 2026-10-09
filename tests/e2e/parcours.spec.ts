@@ -1,6 +1,6 @@
 /**
  * Parcours réels dans un navigateur (Chromium, viewport mobile 390 px).
- * Mode local (Supabase non configuré) : toutes les données restent dans IndexedDB de l'appareil.
+ * Mode local (Neon Auth non configuré) : toutes les données restent dans IndexedDB de l'appareil.
  */
 import { expect, type Page, test } from '@playwright/test';
 

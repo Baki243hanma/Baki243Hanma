@@ -12,6 +12,7 @@
     "build": "vite build",
     "postinstall": "vite build",
     "start": "node server/index.js",
+    "db:migrate": "node scripts/migrate.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -19,7 +20,7 @@
     "test:all": "npm run typecheck && vitest run && playwright test"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.117.3",
+    "@neondatabase/neon-js": "0.7.0-beta",
     "@tailwindcss/vite": "^4.3.3",
     "@types/express": "^5.0.3",
     "@types/node": "^22.20.5",
@@ -29,6 +30,8 @@
     "dexie": "^4.4.6",
     "dexie-react-hooks": "^4.4.0",
     "express": "^5.3.0",
+    "jose": "6.2.12",
+    "pg": "8.23.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.18.4",

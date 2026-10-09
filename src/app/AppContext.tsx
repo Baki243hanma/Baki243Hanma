@@ -3,19 +3,18 @@
  * boutique, état réseau et synchronisation.
  *
  * Deux modes :
- *  - « remote » : Supabase configuré -> connexion obligatoire, données synchronisées.
- *  - « local »  : Supabase non configuré -> mode de développement, données sur cet appareil
+ *  - « remote » : Neon Auth configuré -> connexion obligatoire, données synchronisées via l'API.
+ *  - « local »  : Neon Auth non configuré -> mode de développement, données sur cet appareil
  *                 uniquement (affiché clairement à l'utilisateur).
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
-import type { Session, SupabaseClient, User } from '@supabase/supabase-js';
 import { ShopDatabase, databaseName } from '../db/database';
 import { countPendingOperations, updateShopName } from '../db/repo';
 import { newId } from '../lib/ids';
-import { loadRuntimeConfig, type RuntimeConfig } from '../supabase/config';
-import { createSupabaseClient } from '../supabase/client';
-import { createSupabaseRemote, TransportError, type RemoteAdapter } from '../sync/remote';
+import { loadRuntimeConfig, type RuntimeConfig } from '../auth/config';
+import { createNeonAuthClient, type AuthClient } from '../auth/client';
+import { createHttpRemote, ServerError, TransportError, type RemoteAdapter } from '../sync/remote';
 import { SyncManager, type SyncState } from '../sync/manager';
 
 export interface Shop {
@@ -61,17 +60,17 @@ export function useApp(): AppContextValue {
 
 /** Traduit les erreurs d'authentification en français simple. */
 export function authErrorMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error ?? '');
+  const raw = error instanceof Error ? error.message : String((error as { message?: unknown } | null)?.message ?? error ?? '');
   const msg = raw.toLowerCase();
-  if (msg.includes('invalid login credentials')) return 'Email ou mot de passe incorrect.';
-  if (msg.includes('email not confirmed')) {
+  if (msg.includes('invalid email or password') || msg.includes('invalid credentials')) return 'Email ou mot de passe incorrect.';
+  if (msg.includes('email not verified') || msg.includes('not verified')) {
     return 'Confirmez votre adresse email (lien reçu par email) avant de vous connecter.';
   }
-  if (msg.includes('already registered') || msg.includes('already been registered')) {
+  if (msg.includes('already exists') || msg.includes('already registered')) {
     return 'Un compte existe déjà avec cet email. Connectez-vous.';
   }
-  if (msg.includes('password should be at least') || msg.includes('password')) {
-    return 'Le mot de passe doit contenir au moins 6 caractères.';
+  if (msg.includes('password') && (msg.includes('at least') || msg.includes('short') || msg.includes('minimum'))) {
+    return 'Le mot de passe doit contenir au moins 8 caractères.';
   }
   if (msg.includes('rate limit') || msg.includes('too many')) {
     return 'Trop de tentatives. Patientez quelques minutes avant de réessayer.';
@@ -83,13 +82,33 @@ export function authErrorMessage(error: unknown): string {
   return 'Connexion impossible pour le moment. Réessayez.';
 }
 
-function userEmail(user: User | null | undefined): string | null {
-  return user?.email ?? null;
+/** Identité mémorisée : permet de rester sur sa base locale hors ligne (session non vérifiable). */
+const USER_CACHE_KEY = 'shopflow-rdc.user';
+
+function readCachedUser(): { userId: string; email: string | null } | null {
+  try {
+    const raw = localStorage.getItem(USER_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { userId?: unknown; email?: unknown };
+    if (typeof parsed.userId !== 'string' || parsed.userId.length === 0) return null;
+    return { userId: parsed.userId, email: typeof parsed.email === 'string' ? parsed.email : null };
+  } catch {
+    return null;
+  }
+}
+
+function writeCachedUser(user: { userId: string; email: string | null } | null): void {
+  try {
+    if (user) localStorage.setItem(USER_CACHE_KEY, JSON.stringify(user));
+    else localStorage.removeItem(USER_CACHE_KEY);
+  } catch {
+    /* stockage indisponible */
+  }
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<RuntimeConfig | null>(null);
-  const [client, setClient] = useState<SupabaseClient | null>(null);
+  const [client, setClient] = useState<AuthClient | null>(null);
   const [auth, setAuth] = useState<AuthView>({ status: 'loading', userId: null, email: null });
   const [nameHint, setNameHint] = useState<string | null>(null);
   const [db, setDb] = useState<ShopDatabase | null>(null);
@@ -103,29 +122,37 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // 1. Configuration + session
   useEffect(() => {
     let active = true;
-    void loadRuntimeConfig().then((cfg) => {
+    void loadRuntimeConfig().then(async (cfg) => {
       if (!active) return;
       setConfig(cfg);
-      if (cfg.supabaseUrl && cfg.supabaseAnonKey) {
-        const c = createSupabaseClient(cfg.supabaseUrl, cfg.supabaseAnonKey);
-        setClient(c);
-        void c.auth.getSession().then(({ data }) => {
-          if (!active) return;
-          const session: Session | null = data.session;
-          setAuth(session ? { status: 'signed_in', userId: session.user.id, email: userEmail(session.user) } : { status: 'signed_out', userId: null, email: null });
-        });
-        const { data: sub } = c.auth.onAuthStateChange((event, session) => {
-          if (!active) return;
-          if (session) {
-            setAuth({ status: 'signed_in', userId: session.user.id, email: userEmail(session.user) });
-          } else if (event === 'SIGNED_OUT' || event === 'INITIAL_SESSION') {
-            setAuth({ status: 'signed_out', userId: null, email: null });
-          }
-        });
-        return () => sub.subscription.unsubscribe();
+      if (!cfg.authUrl) {
+        setAuth({ status: 'local', userId: null, email: null });
+        return;
       }
-      setAuth({ status: 'local', userId: null, email: null });
-      return undefined;
+      const c = createNeonAuthClient(cfg.authUrl);
+      setClient(c);
+      try {
+        const res = await c.getSession();
+        if (!active) return;
+        const user = res.data?.user;
+        if (user) {
+          const identity = { userId: user.id, email: user.email ?? null };
+          writeCachedUser(identity);
+          setAuth({ status: 'signed_in', ...identity });
+        } else if (!res.error) {
+          // Réponse définitive : aucune session.
+          writeCachedUser(null);
+          setAuth({ status: 'signed_out', userId: null, email: null });
+        } else {
+          // Vérification impossible (hors ligne) : on garde l'identité connue pour rester sur sa base locale.
+          const cached = readCachedUser();
+          setAuth(cached ? { status: 'signed_in', ...cached } : { status: 'signed_out', userId: null, email: null });
+        }
+      } catch {
+        if (!active) return;
+        const cached = readCachedUser();
+        setAuth(cached ? { status: 'signed_in', ...cached } : { status: 'signed_out', userId: null, email: null });
+      }
     });
     return () => {
       active = false;
@@ -182,37 +209,50 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const shop = shopRow?.shop ?? null;
   const shopLoaded = shopRow !== undefined;
 
+  // Client HTTP de l'API (jeton Neon Auth à chaque appel).
+  // Jeton Neon Auth (JWT) fourni à chaque appel. Une erreur réseau remonte telle quelle (opération en attente).
+  const api = useMemo(() => {
+    if (!client) return null;
+    return createHttpRemote({
+      getToken: async () => {
+        const { data, error } = await client.token();
+        if (error) return null;
+        return data?.token ?? null;
+      },
+    });
+  }, [client]);
   // 5. Création de la boutique côté serveur (première connexion)
   useEffect(() => {
-    if (!db || !client || auth.status !== 'signed_in' || !shopLoaded || shop || !online) return;
+    if (!db || !api || auth.status !== 'signed_in' || !shopLoaded || shop || !online) return;
     let cancelled = false;
     void (async () => {
-      const { data, error } = await client.rpc('ensure_shop', { p_name: nameHint });
-      if (cancelled) return;
-      if (error) {
-        if (String(error.message).includes('shop_name_required')) {
+      try {
+        const row = await api.ensureShop(nameHint);
+        if (cancelled) return;
+        await db.meta.put({ key: 'shop', value: { id: row.id, name: row.name } });
+      } catch (err) {
+        if (cancelled) return;
+        if (err instanceof ServerError && err.code === '22023') {
           setSetupNeedsName(true);
           return;
         }
-        if (/^[0-9A-Z]{5}$/.test(error.code ?? '')) {
-          setShopSetupError(`Le serveur a refusé la configuration de la boutique : ${error.message}`);
+        if (err instanceof ServerError) {
+          setShopSetupError(`Le serveur a refusé la configuration de la boutique : ${err.message}`);
           return;
         }
         setShopSetupError('Connexion nécessaire pour configurer votre boutique la première fois.');
         return;
       }
-      const row = data as { id: string; name: string };
-      await db.meta.put({ key: 'shop', value: { id: row.id, name: row.name } });
       setSetupNeedsName(false);
       setShopSetupError(null);
     })();
     return () => {
       cancelled = true;
     };
-  }, [db, client, auth.status, shopLoaded, shop, online, nameHint]);
+  }, [db, api, auth.status, shopLoaded, shop, online, nameHint]);
 
   // 6. Synchronisation
-  const remote: RemoteAdapter | null = useMemo(() => (client ? createSupabaseRemote(client) : null), [client]);
+  const remote: RemoteAdapter | null = api;
   const shopId = shop?.id ?? null;
   useEffect(() => {
     if (!db) {
@@ -243,38 +283,54 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [manager]);
 
   // ---- Actions d'authentification
+  const refreshAuth = useCallback(async () => {
+    if (!client) return;
+    const res = await client.getSession();
+    const user = res.data?.user;
+    if (user) {
+      const identity = { userId: user.id, email: user.email ?? null };
+      writeCachedUser(identity);
+      setAuth({ status: 'signed_in', ...identity });
+    } else {
+      writeCachedUser(null);
+      setAuth({ status: 'signed_out', userId: null, email: null });
+    }
+  }, [client]);
+
   const signIn = useCallback(
     async (email: string, password: string) => {
       if (!client) throw new Error('Authentification non configurée.');
-      const { error } = await client.auth.signInWithPassword({ email: email.trim(), password });
+      const { error } = await client.signIn.email({ email: email.trim(), password });
       if (error) throw new Error(authErrorMessage(error));
+      await refreshAuth();
     },
-    [client],
+    [client, refreshAuth],
   );
 
   const signUp = useCallback(
     async (email: string, password: string, shopName: string) => {
       if (!client) throw new Error('Authentification non configurée.');
       const cleanName = shopName.trim();
-      const { data, error } = await client.auth.signUp({
-        email: email.trim(),
-        password,
-        options: {
-          data: { shop_name: cleanName },
-          emailRedirectTo: typeof window !== 'undefined' ? window.location.origin : undefined,
-        },
-      });
+      const { error } = await client.signUp.email({ name: cleanName, email: email.trim(), password });
       if (error) throw new Error(authErrorMessage(error));
       setNameHint(cleanName);
-      return { needsEmailConfirmation: !data.session };
+      const res = await client.getSession();
+      const hasSession = Boolean(res.data?.session);
+      await refreshAuth();
+      return { needsEmailConfirmation: !hasSession };
     },
-    [client],
+    [client, refreshAuth],
   );
 
   const signOut = useCallback(async () => {
     if (!client) return;
-    // Portée « local » : la déconnexion fonctionne même hors ligne. Les données restent sur l'appareil.
-    await client.auth.signOut({ scope: 'local' });
+    // Les données restent sur l'appareil : seule la session est fermée.
+    try {
+      await client.signOut();
+    } finally {
+      writeCachedUser(null);
+      setAuth({ status: 'signed_out', userId: null, email: null });
+    }
   }, [client]);
 
   const completeShopSetup = useCallback(
@@ -282,14 +338,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const clean = name.trim();
       if (clean.length === 0 || clean.length > 120) throw new Error('Le nom de la boutique doit contenir entre 1 et 120 caractères.');
       if (!db) throw new Error('Base locale non prête.');
-      if (client && auth.status === 'signed_in') {
+      if (api && auth.status === 'signed_in') {
         setNameHint(clean);
-        const { data, error } = await client.rpc('ensure_shop', { p_name: clean });
-        if (error) {
-          if (/^[0-9A-Z]{5}$/.test(error.code ?? '')) throw new Error(`Refus du serveur : ${error.message}`);
+        let row: { id: string; name: string };
+        try {
+          row = await api.ensureShop(clean);
+        } catch (err) {
+          if (err instanceof ServerError) throw new Error(`Refus du serveur : ${err.message}`);
           throw new TransportError('Connexion Internet nécessaire pour créer votre boutique.');
         }
-        const row = data as { id: string; name: string };
         await db.meta.put({ key: 'shop', value: { id: row.id, name: row.name } });
         setSetupNeedsName(false);
         return;
@@ -297,7 +354,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       await db.meta.put({ key: 'shop', value: { id: newId(), name: clean } });
       setSetupNeedsName(false);
     },
-    [db, client, auth.status],
+    [db, api, auth.status],
   );
 
   const renameShop = useCallback(

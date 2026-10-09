@@ -1,9 +1,8 @@
-import type { Express } from 'express';
-
-export interface PublicConfig {
-  supabaseUrl: string;
-  supabaseAnonKey: string;
+export interface ServerConfig {
+  port: number;
+  host: string;
+  databaseUrl: string;
+  authUrl: string;
+  migrateOnStart: boolean;
 }
-
-export declare function createApp(): Express;
-export declare function publicConfig(): PublicConfig;
+export declare function readConfig(env?: Record<string, string | undefined>): ServerConfig;

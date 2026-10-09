@@ -17,18 +17,23 @@ import {
 import { newId } from '../../src/lib/ids';
 import { runSync, type SyncReport } from '../../src/sync/engine';
 import { uniqueDbName } from '../helpers/names';
-import { asAdmin, asUser, countRows, createShopFor, createTestDatabase, createUser, flaky, pgRemote, stockDrift } from '../helpers/pg';
+import { asAdmin, asUser, countRows, createShopFor, createTestDatabase, createUser, flaky, pgliteDatabase, stockDrift } from '../helpers/pg';
+import { startTestApi, type TestApi } from '../helpers/api';
+import { ServerError, TransportError } from '../../src/sync/remote';
 import type { ProductFormValues } from '../../src/domain/validation';
 
 let pg: PGlite;
+let api: TestApi;
 const devices: ShopDatabase[] = [];
 const dbNames: string[] = [];
 
 beforeAll(async () => {
   pg = await createTestDatabase();
+  api = await startTestApi(pgliteDatabase(pg));
 });
 
 afterAll(async () => {
+  await api.close();
   await pg.close();
 });
 
@@ -51,7 +56,7 @@ async function device(userId: string, shopId: string): Promise<Device> {
   const db = new ShopDatabase(name);
   await db.open();
   devices.push(db);
-  const { remote, ctl, sent } = flaky(pgRemote(pg, userId));
+  const { remote, ctl, sent } = flaky(api.remoteFor(userId));
   return {
     db,
     ctl,
@@ -158,7 +163,7 @@ describe('hors ligne puis synchronisation (critique : offline puis sync, pas de 
     const op = await d.db.sync_operations.where('type').equals('create_order').first();
     await d.sync();
 
-    const remote = pgRemote(pg, userId);
+    const remote = api.remoteFor(userId);
     const replay = await remote.apply({ op_id: op!.op_id, type: 'create_order', payload: op!.payload });
     expect(replay.duplicate).toBe(true);
     expect(await countRows(pg, `select id from public.orders where shop_id = '${shopId}'`)).toBe(1);
@@ -398,7 +403,7 @@ describe('annulation et prix : traçabilité côté serveur', () => {
       ...op.payload,
       order: { ...(op.payload.order as Record<string, unknown>), id: newOrderId, total_amount: 1, total_cost: 1, total_quantity: 99 },
     };
-    const result = await pgRemote(pg, userId).apply({ op_id: newId(), type: 'create_order', payload: tampered });
+    const result = await api.remoteFor(userId).apply({ op_id: newId(), type: 'create_order', payload: tampered });
     expect(result.status).toBe('applied');
     expect(result.total_amount).toBe(10000);
     expect(result.total_cost).toBe(5000);
@@ -454,15 +459,15 @@ describe('isolation entre deux comptes (critique)', () => {
 
     // Le compte B interroge sa propre boutique : rien de celle de A
     const devB = await device(b.userId, b.shopId);
-    const pulled = await pgRemote(pg, b.userId).pull(b.shopId);
+    const pulled = await api.remoteFor(b.userId).pull(b.shopId);
     expect(pulled.products).toEqual([]);
     expect(pulled.orders).toEqual([]);
     expect(pulled.movements).toEqual([]);
 
-    // Tentative de lecture de la boutique A : RLS -> aucune ligne, pas d’erreur qui révélerait l’existence
-    const foreignPull = await pgRemote(pg, b.userId).pull(a.shopId);
-    expect(foreignPull.shop).toBeNull();
-    expect(foreignPull.products).toEqual([]);
+    // Lecture de la boutique A : refusée par le serveur (403), sans révéler le contenu
+    const foreignPull = await api.remoteFor(b.userId).pull(a.shopId).catch((e: unknown) => e);
+    expect(foreignPull).toBeInstanceOf(ServerError);
+    expect((foreignPull as ServerError).code).toBe('forbidden_shop');
 
     // Tentative d’écriture dans la boutique A : refusée par la fonction serveur
     const foreignOp = {
@@ -470,7 +475,7 @@ describe('isolation entre deux comptes (critique)', () => {
       type: 'stock_movement' as const,
       payload: { shop_id: a.shopId, movement: { id: newId(), product_id: prod.id, delta: 100, type: 'entry', reason: 'Piratage' } },
     };
-    await expect(pgRemote(pg, b.userId).apply(foreignOp)).rejects.toMatchObject({ code: '42501' });
+    await expect(api.remoteFor(b.userId).apply(foreignOp)).rejects.toMatchObject({ code: '42501' });
     expect((await devA.db.products.get(prod.id))?.quantity).toBe(8);
     expect(await stockDrift(pg, a.shopId)).toEqual([]);
 
@@ -480,15 +485,30 @@ describe('isolation entre deux comptes (critique)', () => {
     expect(await devB.db.orders.count()).toBe(0);
   });
 
-  it('un visiteur anonyme ne peut ni lire ni appeler les fonctions de synchronisation', async () => {
+  it('sans session, rien n’est envoyé : l’opération reste en attente (aucune écriture serveur)', async () => {
     const a = await newAccount('ownerC');
-    await asUser(pg, null);
-    await expect(pg.query('select * from public.products')).rejects.toMatchObject({ code: '42501' });
+    const before = await countRows(pg, 'select id from public.products');
+    const anonymous = api.remoteFor(null);
+    await expect(anonymous.apply({ op_id: newId(), type: 'create_order', payload: { shop_id: a.shopId } })).rejects.toBeInstanceOf(TransportError);
+    await expect(anonymous.pull(a.shopId)).rejects.toBeInstanceOf(TransportError);
+    expect(await countRows(pg, 'select id from public.products')).toBe(before);
+  });
+
+  it('la RLS limite la lecture directe à la boutique du compte (défense en profondeur)', async () => {
+    const a = await newAccount('rlsA');
+    const b = await newAccount('rlsB');
+    const devA = await device(a.userId, a.shopId);
+    await createProduct(devA.db, a.shopId, product({ name: 'Visible A', initial_quantity: 3 }));
+    await devA.sync();
+
+    await asUser(pg, b.userId);
+    const { rows } = await pg.query<{ name: string }>('select name from public.products');
     await asAdmin(pg);
-    await expect(pgRemote(pg, null).apply({ op_id: newId(), type: 'create_order', payload: { shop_id: a.shopId } })).rejects.toMatchObject({
-      name: 'ServerError',
-    });
-    const pulled = await pgRemote(pg, null).pull(a.shopId).catch((e: Error) => e);
-    expect(pulled).toBeInstanceOf(Error);
+    expect(rows).toEqual([]);
+
+    await asUser(pg, a.userId);
+    const own = await pg.query<{ name: string }>('select name from public.products');
+    await asAdmin(pg);
+    expect(own.rows.map((r) => r.name)).toEqual(['Visible A']);
   });
 });
